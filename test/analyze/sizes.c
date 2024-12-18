@@ -29,12 +29,14 @@ do_print(const char *name, size_t sz_bytes) {
 }
 
 int
-main() {
+main(void) {
 #define P(type)								\
 	do_print(#type, sizeof(type))
 	P(arena_t);
 	P(arena_stats_t);
 	P(base_t);
+	P(bin_t);
+	P(bin_with_batch_t);
 	P(decay_t);
 	P(edata_t);
 	P(ecache_t);

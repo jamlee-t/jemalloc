@@ -1,14 +1,22 @@
 #ifndef JEMALLOC_INTERNAL_ARENA_INLINES_B_H
 #define JEMALLOC_INTERNAL_ARENA_INLINES_B_H
 
+#include "jemalloc/internal/jemalloc_preamble.h"
+#include "jemalloc/internal/arena_externs.h"
+#include "jemalloc/internal/arena_structs.h"
 #include "jemalloc/internal/div.h"
 #include "jemalloc/internal/emap.h"
+#include "jemalloc/internal/jemalloc_internal_inlines_b.h"
 #include "jemalloc/internal/jemalloc_internal_types.h"
+#include "jemalloc/internal/large_externs.h"
 #include "jemalloc/internal/mutex.h"
+#include "jemalloc/internal/prof_externs.h"
+#include "jemalloc/internal/prof_structs.h"
 #include "jemalloc/internal/rtree.h"
 #include "jemalloc/internal/safety_check.h"
 #include "jemalloc/internal/sc.h"
 #include "jemalloc/internal/sz.h"
+#include "jemalloc/internal/tcache_inlines.h"
 #include "jemalloc/internal/ticker.h"
 
 static inline arena_t *
@@ -96,15 +104,15 @@ arena_prof_info_get(tsd_t *tsd, const void *ptr, emap_alloc_ctx_t *alloc_ctx,
 		if (reset_recent &&
 		    large_dalloc_safety_checks(edata, ptr,
 		    edata_szind_get(edata))) {
-			prof_info->alloc_tctx = (prof_tctx_t *)(uintptr_t)1U;
+			prof_info->alloc_tctx = PROF_TCTX_SENTINEL;
 			return;
 		}
 		large_prof_info_get(tsd, edata, prof_info, reset_recent);
 	} else {
-		prof_info->alloc_tctx = (prof_tctx_t *)(uintptr_t)1U;
+		prof_info->alloc_tctx = PROF_TCTX_SENTINEL;
 		/*
 		 * No need to set other fields in prof_info; they will never be
-		 * accessed if (uintptr_t)alloc_tctx == (uintptr_t)1U.
+		 * accessed if alloc_tctx == PROF_TCTX_SENTINEL.
 		 */
 	}
 }
@@ -182,23 +190,25 @@ arena_decay_tick(tsdn_t *tsdn, arena_t *arena) {
 
 JEMALLOC_ALWAYS_INLINE void *
 arena_malloc(tsdn_t *tsdn, arena_t *arena, size_t size, szind_t ind, bool zero,
-    tcache_t *tcache, bool slow_path) {
+    bool slab, tcache_t *tcache, bool slow_path) {
 	assert(!tsdn_null(tsdn) || tcache == NULL);
 
 	if (likely(tcache != NULL)) {
-		if (likely(size <= SC_SMALL_MAXCLASS)) {
+		if (likely(slab)) {
+			assert(sz_can_use_slab(size));
 			return tcache_alloc_small(tsdn_tsd(tsdn), arena,
 			    tcache, size, ind, zero, slow_path);
-		}
-		if (likely(size <= tcache_maxclass)) {
+		} else if (likely(
+		    ind < tcache_nbins_get(tcache->tcache_slow) &&
+		    !tcache_bin_disabled(ind, &tcache->bins[ind],
+		    tcache->tcache_slow))) {
 			return tcache_alloc_large(tsdn_tsd(tsdn), arena,
 			    tcache, size, ind, zero, slow_path);
 		}
-		/* (size > tcache_maxclass) case falls through. */
-		assert(size > tcache_maxclass);
+		/* (size > tcache_max) case falls through. */
 	}
 
-	return arena_malloc_hard(tsdn, arena, size, ind, zero);
+	return arena_malloc_hard(tsdn, arena, size, ind, zero, slab);
 }
 
 JEMALLOC_ALWAYS_INLINE arena_t *
@@ -290,21 +300,25 @@ arena_dalloc_no_tcache(tsdn_t *tsdn, void *ptr) {
 JEMALLOC_ALWAYS_INLINE void
 arena_dalloc_large(tsdn_t *tsdn, void *ptr, tcache_t *tcache, szind_t szind,
     bool slow_path) {
-	if (szind < nhbins) {
-		if (config_prof && unlikely(szind < SC_NBINS)) {
-			arena_dalloc_promoted(tsdn, ptr, tcache, slow_path);
-		} else {
+	assert (!tsdn_null(tsdn) && tcache != NULL);
+	bool is_sample_promoted = config_prof && szind < SC_NBINS;
+	if (unlikely(is_sample_promoted)) {
+		arena_dalloc_promoted(tsdn, ptr, tcache, slow_path);
+	} else {
+		if (szind < tcache_nbins_get(tcache->tcache_slow) &&
+		    !tcache_bin_disabled(szind, &tcache->bins[szind],
+		    tcache->tcache_slow)) {
 			tcache_dalloc_large(tsdn_tsd(tsdn), tcache, ptr, szind,
 			    slow_path);
+		} else {
+			edata_t *edata = emap_edata_lookup(tsdn,
+			    &arena_emap_global, ptr);
+			if (large_dalloc_safety_checks(edata, ptr, szind)) {
+				/* See the comment in isfree. */
+				return;
+			}
+			large_dalloc(tsdn, edata);
 		}
-	} else {
-		edata_t *edata = emap_edata_lookup(tsdn, &arena_emap_global,
-		    ptr);
-		if (large_dalloc_safety_checks(edata, ptr, szind)) {
-			/* See the comment in isfree. */
-			return;
-		}
-		large_dalloc(tsdn, edata);
 	}
 }
 
@@ -371,7 +385,7 @@ arena_dalloc(tsdn_t *tsdn, void *ptr, tcache_t *tcache,
 	if (caller_alloc_ctx != NULL) {
 		alloc_ctx = *caller_alloc_ctx;
 	} else {
-		util_assume(!tsdn_null(tsdn));
+		util_assume(tsdn != NULL);
 		emap_alloc_ctx_lookup(tsdn, &arena_emap_global, ptr,
 		    &alloc_ctx);
 	}
@@ -506,7 +520,7 @@ arena_cache_oblivious_randomize(tsdn_t *tsdn, arena_t *arena, edata_t *edata,
 		}
 		uintptr_t random_offset = ((uintptr_t)r) << (LG_PAGE -
 		    lg_range);
-		edata->e_addr = (void *)((uintptr_t)edata->e_addr +
+		edata->e_addr = (void *)((byte_t *)edata->e_addr +
 		    random_offset);
 		assert(ALIGNMENT_ADDR2BASE(edata->e_addr, alignment) ==
 		    edata->e_addr);
@@ -549,10 +563,11 @@ arena_dalloc_bin_locked_begin(arena_dalloc_bin_locked_info_t *info,
  * stats updates, which happen during finish (this lets running counts get left
  * in a register).
  */
-JEMALLOC_ALWAYS_INLINE bool
+JEMALLOC_ALWAYS_INLINE void
 arena_dalloc_bin_locked_step(tsdn_t *tsdn, arena_t *arena, bin_t *bin,
     arena_dalloc_bin_locked_info_t *info, szind_t binind, edata_t *slab,
-    void *ptr) {
+    void *ptr, edata_t **dalloc_slabs, unsigned ndalloc_slabs,
+    unsigned *dalloc_slabs_count, edata_list_active_t *dalloc_slabs_extra) {
 	const bin_info_t *bin_info = &bin_infos[binind];
 	size_t regind = arena_slab_regind(info, binind, slab, ptr);
 	slab_data_t *slab_data = edata_slab_data_get(slab);
@@ -572,12 +587,17 @@ arena_dalloc_bin_locked_step(tsdn_t *tsdn, arena_t *arena, bin_t *bin,
 	if (nfree == bin_info->nregs) {
 		arena_dalloc_bin_locked_handle_newly_empty(tsdn, arena, slab,
 		    bin);
-		return true;
+
+		if (*dalloc_slabs_count < ndalloc_slabs) {
+			dalloc_slabs[*dalloc_slabs_count] = slab;
+			(*dalloc_slabs_count)++;
+		} else {
+			edata_list_active_append(dalloc_slabs_extra, slab);
+		}
 	} else if (nfree == 1 && slab != bin->slabcur) {
 		arena_dalloc_bin_locked_handle_newly_nonempty(tsdn, arena, slab,
 		    bin);
 	}
-	return false;
 }
 
 JEMALLOC_ALWAYS_INLINE void
@@ -590,10 +610,149 @@ arena_dalloc_bin_locked_finish(tsdn_t *tsdn, arena_t *arena, bin_t *bin,
 	}
 }
 
+JEMALLOC_ALWAYS_INLINE void
+arena_bin_flush_batch_impl(tsdn_t *tsdn, arena_t *arena, bin_t *bin,
+    arena_dalloc_bin_locked_info_t *dalloc_bin_info, unsigned binind,
+    edata_t **dalloc_slabs, unsigned ndalloc_slabs, unsigned *dalloc_count,
+    edata_list_active_t *dalloc_slabs_extra) {
+	assert(binind < bin_info_nbatched_sizes);
+	bin_with_batch_t *batched_bin = (bin_with_batch_t *)bin;
+	size_t nelems_to_pop = batcher_pop_begin(tsdn,
+	    &batched_bin->remote_frees);
+
+	bin_batching_test_mid_pop(nelems_to_pop);
+	if (nelems_to_pop == BATCHER_NO_IDX) {
+		malloc_mutex_assert_not_owner(tsdn,
+		    &batched_bin->remote_frees.mtx);
+		return;
+	} else {
+		malloc_mutex_assert_owner(tsdn,
+		    &batched_bin->remote_frees.mtx);
+	}
+
+	size_t npushes = batcher_pop_get_pushes(tsdn,
+	    &batched_bin->remote_frees);
+	bin_remote_free_data_t remote_free_data[BIN_REMOTE_FREE_ELEMS_MAX];
+	for (size_t i = 0; i < nelems_to_pop; i++) {
+		remote_free_data[i] = batched_bin->remote_free_data[i];
+	}
+	batcher_pop_end(tsdn, &batched_bin->remote_frees);
+
+	for (size_t i = 0; i < nelems_to_pop; i++) {
+		arena_dalloc_bin_locked_step(tsdn, arena, bin, dalloc_bin_info,
+		    binind, remote_free_data[i].slab, remote_free_data[i].ptr,
+		    dalloc_slabs, ndalloc_slabs, dalloc_count,
+		    dalloc_slabs_extra);
+	}
+
+	bin->stats.batch_pops++;
+	bin->stats.batch_pushes += npushes;
+	bin->stats.batch_pushed_elems += nelems_to_pop;
+}
+
+typedef struct arena_bin_flush_batch_state_s arena_bin_flush_batch_state_t;
+struct arena_bin_flush_batch_state_s {
+	arena_dalloc_bin_locked_info_t info;
+
+	/*
+	 * Bin batching is subtle in that there are unusual edge cases in which
+	 * it can trigger the deallocation of more slabs than there were items
+	 * flushed (say, if every original deallocation triggered a slab
+	 * deallocation, and so did every batched one).  So we keep a small
+	 * backup array for any "extra" slabs, as well as a a list to allow a
+	 * dynamic number of ones exceeding that array.
+	 */
+	edata_t *dalloc_slabs[8];
+	unsigned dalloc_slab_count;
+	edata_list_active_t dalloc_slabs_extra;
+};
+
+JEMALLOC_ALWAYS_INLINE unsigned
+arena_bin_batch_get_ndalloc_slabs(unsigned preallocated_slabs) {
+	if (preallocated_slabs > bin_batching_test_ndalloc_slabs_max) {
+		return bin_batching_test_ndalloc_slabs_max;
+	}
+	return preallocated_slabs;
+}
+
+JEMALLOC_ALWAYS_INLINE void
+arena_bin_flush_batch_after_lock(tsdn_t *tsdn, arena_t *arena, bin_t *bin,
+    unsigned binind, arena_bin_flush_batch_state_t *state) {
+	if (binind >= bin_info_nbatched_sizes) {
+		return;
+	}
+
+	arena_dalloc_bin_locked_begin(&state->info, binind);
+	state->dalloc_slab_count = 0;
+	edata_list_active_init(&state->dalloc_slabs_extra);
+
+	unsigned preallocated_slabs = (unsigned)(sizeof(state->dalloc_slabs)
+	    / sizeof(state->dalloc_slabs[0]));
+	unsigned ndalloc_slabs = arena_bin_batch_get_ndalloc_slabs(
+	    preallocated_slabs);
+
+	arena_bin_flush_batch_impl(tsdn, arena, bin, &state->info, binind,
+	    state->dalloc_slabs, ndalloc_slabs,
+	    &state->dalloc_slab_count, &state->dalloc_slabs_extra);
+}
+
+JEMALLOC_ALWAYS_INLINE void
+arena_bin_flush_batch_before_unlock(tsdn_t *tsdn, arena_t *arena, bin_t *bin,
+    unsigned binind, arena_bin_flush_batch_state_t *state) {
+	if (binind >= bin_info_nbatched_sizes) {
+		return;
+	}
+
+	arena_dalloc_bin_locked_finish(tsdn, arena, bin, &state->info);
+}
+
+static inline bool
+arena_bin_has_batch(szind_t binind) {
+	return binind < bin_info_nbatched_sizes;
+}
+
+JEMALLOC_ALWAYS_INLINE void
+arena_bin_flush_batch_after_unlock(tsdn_t *tsdn, arena_t *arena, bin_t *bin,
+    unsigned binind, arena_bin_flush_batch_state_t *state) {
+	if (!arena_bin_has_batch(binind)) {
+		return;
+	}
+	/*
+	 * The initialization of dalloc_slabs_extra is guarded by an
+	 * arena_bin_has_batch check higher up the stack.  But the clang
+	 * analyzer forgets this down the stack, triggering a spurious error
+	 * reported here.
+	 */
+	JEMALLOC_CLANG_ANALYZER_SUPPRESS {
+		bin_batching_test_after_unlock(state->dalloc_slab_count,
+		    edata_list_active_empty(&state->dalloc_slabs_extra));
+	}
+	for (unsigned i = 0; i < state->dalloc_slab_count; i++) {
+		edata_t *slab = state->dalloc_slabs[i];
+		arena_slab_dalloc(tsdn, arena_get_from_edata(slab), slab);
+	}
+	while (!edata_list_active_empty(&state->dalloc_slabs_extra)) {
+		edata_t *slab = edata_list_active_first(
+		    &state->dalloc_slabs_extra);
+		edata_list_active_remove(&state->dalloc_slabs_extra, slab);
+		arena_slab_dalloc(tsdn, arena_get_from_edata(slab), slab);
+	}
+}
+
 static inline bin_t *
 arena_get_bin(arena_t *arena, szind_t binind, unsigned binshard) {
-	bin_t *shard0 = (bin_t *)((uintptr_t)arena + arena_bin_offsets[binind]);
-	return shard0 + binshard;
+	bin_t *shard0 = (bin_t *)((byte_t *)arena + arena_bin_offsets[binind]);
+	bin_t *ret;
+	if (arena_bin_has_batch(binind)) {
+		ret = (bin_t *)((bin_with_batch_t *)shard0 + binshard);
+	} else {
+		ret = shard0 + binshard;
+	}
+	assert(binind >= SC_NBINS - 1
+	    || (uintptr_t)ret < (uintptr_t)arena
+	    + arena_bin_offsets[binind + 1]);
+
+	return ret;
 }
 
 #endif /* JEMALLOC_INTERNAL_ARENA_INLINES_B_H */

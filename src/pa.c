@@ -11,13 +11,13 @@ pa_nactive_add(pa_shard_t *shard, size_t add_pages) {
 
 static void
 pa_nactive_sub(pa_shard_t *shard, size_t sub_pages) {
-	assert(atomic_load_zu(&shard->nactive, ATOMIC_RELAXED) >= sub_pages);
+	assert(pa_shard_nactive(shard) >= sub_pages);
 	atomic_fetch_sub_zu(&shard->nactive, sub_pages, ATOMIC_RELAXED);
 }
 
 bool
 pa_central_init(pa_central_t *central, base_t *base, bool hpa,
-    hpa_hooks_t *hpa_hooks) {
+    const hpa_hooks_t *hpa_hooks) {
 	bool err;
 	if (hpa) {
 		err = hpa_central_init(&central->hpa, base, hpa_hooks);
@@ -218,13 +218,6 @@ pa_dalloc(tsdn_t *tsdn, pa_shard_t *shard, edata_t *edata,
 	pa_nactive_sub(shard, edata_size_get(edata) >> LG_PAGE);
 	pai_t *pai = pa_get_pai(shard, edata);
 	pai_dalloc(tsdn, pai, edata, deferred_work_generated);
-}
-
-bool
-pa_shard_retain_grow_limit_get_set(tsdn_t *tsdn, pa_shard_t *shard,
-    size_t *old_limit, size_t *new_limit) {
-	return pac_retain_grow_limit_get_set(tsdn, &shard->pac, old_limit,
-	    new_limit);
 }
 
 bool

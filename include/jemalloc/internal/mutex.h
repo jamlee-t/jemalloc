@@ -1,6 +1,7 @@
 #ifndef JEMALLOC_INTERNAL_MUTEX_H
 #define JEMALLOC_INTERNAL_MUTEX_H
 
+#include "jemalloc/internal/jemalloc_preamble.h"
 #include "jemalloc/internal/atomic.h"
 #include "jemalloc/internal/mutex_prof.h"
 #include "jemalloc/internal/tsd.h"
@@ -31,6 +32,14 @@ struct malloc_mutex_s {
 			 * unlocking thread).
 			 */
 			mutex_prof_data_t	prof_data;
+			/*
+			 * Hint flag to avoid exclusive cache line contention
+			 * during spin waiting.  Placed along with prof_data
+			 * since it's always modified even with no contention.
+			 * Modified by the lock owner only (after acquired, and
+			 * before release), and may be read by other threads.
+			 */
+			atomic_b_t		locked;
 #ifdef _WIN32
 #  if _WIN32_WINNT >= 0x0600
 			SRWLOCK         	lock;
@@ -45,11 +54,6 @@ struct malloc_mutex_s {
 #else
 			pthread_mutex_t		lock;
 #endif
-			/*
-			 * Hint flag to avoid exclusive cache line contention
-			 * during spin waiting
-			 */
-			atomic_b_t		locked;
 		};
 		/*
 		 * We only touch witness when configured w/ debug.  However we
@@ -98,21 +102,21 @@ struct malloc_mutex_s {
 #elif (defined(JEMALLOC_OS_UNFAIR_LOCK))
 #  if defined(JEMALLOC_DEBUG)
 #    define MALLOC_MUTEX_INITIALIZER					\
-  {{{LOCK_PROF_DATA_INITIALIZER, OS_UNFAIR_LOCK_INIT, ATOMIC_INIT(false)}}, \
+  {{{LOCK_PROF_DATA_INITIALIZER, ATOMIC_INIT(false), OS_UNFAIR_LOCK_INIT}}, \
          WITNESS_INITIALIZER("mutex", WITNESS_RANK_OMIT), 0}
 #  else
 #    define MALLOC_MUTEX_INITIALIZER                      \
-  {{{LOCK_PROF_DATA_INITIALIZER, OS_UNFAIR_LOCK_INIT, ATOMIC_INIT(false)}},  \
+  {{{LOCK_PROF_DATA_INITIALIZER, ATOMIC_INIT(false), OS_UNFAIR_LOCK_INIT}},  \
       WITNESS_INITIALIZER("mutex", WITNESS_RANK_OMIT)}
 #  endif
 #elif (defined(JEMALLOC_MUTEX_INIT_CB))
 #  if (defined(JEMALLOC_DEBUG))
 #     define MALLOC_MUTEX_INITIALIZER					\
-      {{{LOCK_PROF_DATA_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, NULL, ATOMIC_INIT(false)}},	\
+      {{{LOCK_PROF_DATA_INITIALIZER, ATOMIC_INIT(false), PTHREAD_MUTEX_INITIALIZER, NULL}},	\
            WITNESS_INITIALIZER("mutex", WITNESS_RANK_OMIT), 0}
 #  else
 #     define MALLOC_MUTEX_INITIALIZER					\
-      {{{LOCK_PROF_DATA_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, NULL, ATOMIC_INIT(false)}},	\
+      {{{LOCK_PROF_DATA_INITIALIZER, ATOMIC_INIT(false), PTHREAD_MUTEX_INITIALIZER, NULL}},	\
            WITNESS_INITIALIZER("mutex", WITNESS_RANK_OMIT)}
 #  endif
 
@@ -120,11 +124,11 @@ struct malloc_mutex_s {
 #    define MALLOC_MUTEX_TYPE PTHREAD_MUTEX_DEFAULT
 #  if defined(JEMALLOC_DEBUG)
 #    define MALLOC_MUTEX_INITIALIZER					\
-     {{{LOCK_PROF_DATA_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, ATOMIC_INIT(false)}}, \
+     {{{LOCK_PROF_DATA_INITIALIZER, ATOMIC_INIT(false), PTHREAD_MUTEX_INITIALIZER}}, \
            WITNESS_INITIALIZER("mutex", WITNESS_RANK_OMIT), 0}
 #  else
 #    define MALLOC_MUTEX_INITIALIZER                          \
-     {{{LOCK_PROF_DATA_INITIALIZER, PTHREAD_MUTEX_INITIALIZER, ATOMIC_INIT(false)}},	\
+     {{{LOCK_PROF_DATA_INITIALIZER, ATOMIC_INIT(false), PTHREAD_MUTEX_INITIALIZER}},	\
       WITNESS_INITIALIZER("mutex", WITNESS_RANK_OMIT)}
 #  endif
 #endif
@@ -154,7 +158,12 @@ malloc_mutex_lock_final(malloc_mutex_t *mutex) {
 
 static inline bool
 malloc_mutex_trylock_final(malloc_mutex_t *mutex) {
-	return MALLOC_MUTEX_TRYLOCK(mutex);
+	bool failed = MALLOC_MUTEX_TRYLOCK(mutex);
+	if (!failed) {
+		atomic_store_b(&mutex->locked, true, ATOMIC_RELAXED);
+	}
+
+	return failed;
 }
 
 static inline void
@@ -169,6 +178,12 @@ mutex_owner_stats_update(tsdn_t *tsdn, malloc_mutex_t *mutex) {
 	}
 }
 
+static inline bool
+malloc_mutex_is_locked(malloc_mutex_t *mutex) {
+	/* Used for sanity checking only. */
+	return atomic_load_b(&mutex->locked, ATOMIC_RELAXED);
+}
+
 /* Trylock: return false if the lock is successfully acquired. */
 static inline bool
 malloc_mutex_trylock(tsdn_t *tsdn, malloc_mutex_t *mutex) {
@@ -177,6 +192,7 @@ malloc_mutex_trylock(tsdn_t *tsdn, malloc_mutex_t *mutex) {
 		if (malloc_mutex_trylock_final(mutex)) {
 			return true;
 		}
+		assert(malloc_mutex_is_locked(mutex));
 		mutex_owner_stats_update(tsdn, mutex);
 	}
 	witness_lock(tsdn_witness_tsdp_get(tsdn), &mutex->witness);
@@ -214,8 +230,8 @@ malloc_mutex_lock(tsdn_t *tsdn, malloc_mutex_t *mutex) {
 	if (isthreaded) {
 		if (malloc_mutex_trylock_final(mutex)) {
 			malloc_mutex_lock_slow(mutex);
-			atomic_store_b(&mutex->locked, true, ATOMIC_RELAXED);
 		}
+		assert(malloc_mutex_is_locked(mutex));
 		mutex_owner_stats_update(tsdn, mutex);
 	}
 	witness_lock(tsdn_witness_tsdp_get(tsdn), &mutex->witness);
@@ -223,9 +239,10 @@ malloc_mutex_lock(tsdn_t *tsdn, malloc_mutex_t *mutex) {
 
 static inline void
 malloc_mutex_unlock(tsdn_t *tsdn, malloc_mutex_t *mutex) {
-	atomic_store_b(&mutex->locked, false, ATOMIC_RELAXED);
 	witness_unlock(tsdn_witness_tsdp_get(tsdn), &mutex->witness);
 	if (isthreaded) {
+		assert(malloc_mutex_is_locked(mutex));
+		atomic_store_b(&mutex->locked, false, ATOMIC_RELAXED);
 		MALLOC_MUTEX_UNLOCK(mutex);
 	}
 }
@@ -233,6 +250,9 @@ malloc_mutex_unlock(tsdn_t *tsdn, malloc_mutex_t *mutex) {
 static inline void
 malloc_mutex_assert_owner(tsdn_t *tsdn, malloc_mutex_t *mutex) {
 	witness_assert_owner(tsdn_witness_tsdp_get(tsdn), &mutex->witness);
+	if (isthreaded) {
+		assert(malloc_mutex_is_locked(mutex));
+	}
 }
 
 static inline void

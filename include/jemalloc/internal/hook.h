@@ -1,6 +1,7 @@
 #ifndef JEMALLOC_INTERNAL_HOOK_H
 #define JEMALLOC_INTERNAL_HOOK_H
 
+#include "jemalloc/internal/jemalloc_preamble.h"
 #include "jemalloc/internal/tsd.h"
 
 /*
@@ -144,9 +145,9 @@ struct hook_ralloc_args_s {
  * Returns an opaque handle to be used when removing the hook.  NULL means that
  * we couldn't install the hook.
  */
-bool hook_boot();
+bool hook_boot(void);
 
-void *hook_install(tsdn_t *tsdn, hooks_t *hooks);
+void *hook_install(tsdn_t *tsdn, hooks_t *to_install);
 /* Uninstalls the hook with the handle previously returned from hook_install. */
 void hook_remove(tsdn_t *tsdn, void *opaque);
 

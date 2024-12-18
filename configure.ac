@@ -562,6 +562,21 @@ AC_CACHE_CHECK([asm volatile support],
 if test "x${je_cv_asm_volatile}" = "xyes"; then
   AC_DEFINE([JEMALLOC_HAVE_ASM_VOLATILE], [ ], [ ])
 fi
+AC_CACHE_CHECK([__int128 support],
+               [je_cv_int128],
+               AC_RUN_IFELSE([AC_LANG_PROGRAM(
+[[
+]],
+[[
+      __int128 temp = 0;
+      return temp;
+]])],
+[je_cv_int128=yes],
+[je_cv_int128=no],
+[je_cv_int128=no]))
+if test "x${je_cv_int128}" = "xyes"; then
+  AC_DEFINE([JEMALLOC_HAVE_INT128], [ ], [ ])
+fi
 
 LD_PRELOAD_VAR="LD_PRELOAD"
 so="so"
@@ -878,11 +893,26 @@ AC_SUBST([DUMP_SYMS])
 AC_SUBST([CC_MM])
 
 dnl Determine whether libm must be linked to use e.g. log(3).
-AC_SEARCH_LIBS([log], [m], , [AC_MSG_ERROR([Missing math functions])])
-if test "x$ac_cv_search_log" != "xnone required" ; then
-  LM="$ac_cv_search_log"
-else
+
+# On MSVC, log is an intrinsic that doesn't require libm. However,
+# AC_SEARCH_LIBS does not successfully detect this, as it will try to compile
+# a program using the wrong signature for log. Newer versions of MSVC CL detects
+# this and rejects the program with the following messages.
+#
+# conftest.c(40): warning C4391: 'char log()': incorrect return type for intrinsic function, expected 'double'
+# conftest.c(44): error C2168: 'log': too few actual parameters for intrinsic function
+#
+# Since log is always available on MSVC (it's been around since the dawn of
+# time), we simply always assume it's there if MSVC is detected.
+if test "x$je_cv_msvc" = "xyes" ; then
   LM=
+else
+  AC_SEARCH_LIBS([log], [m], , [AC_MSG_ERROR([Missing math functions])])
+    if test "x$ac_cv_search_log" != "xnone required" ; then
+      LM="$ac_cv_search_log"
+    else
+      LM=
+    fi
 fi
 AC_SUBST(LM)
 
@@ -986,6 +1016,30 @@ JE_COMPILABLE([cold attribute], [],
 JE_CFLAGS_RESTORE()
 if test "x${je_cv_cold}" = "xyes" ; then
   AC_DEFINE([JEMALLOC_HAVE_ATTR_COLD], [ ], [ ])
+fi
+
+dnl Check for deprecated attribute support.
+JE_CFLAGS_SAVE()
+JE_CFLAGS_ADD([-Wdeprecated-declarations])
+JE_COMPILABLE([deprecated attribute],
+              [#if !__has_attribute(deprecated)
+               #error "deprecated attribute not supported"
+               #endif
+               struct has_deprecated_field {
+                   int good;
+                   int __attribute__((deprecated("Do not use"))) bad;
+               };
+              ],
+              [struct has_deprecated_field instance;
+               instance.good = 0;
+               instance.bad = 1;
+              ],
+              [je_cv_deprecated])
+JE_CFLAGS_RESTORE()
+if test "x${je_cv_deprecated}" = "xyes" ; then
+  AC_DEFINE([JEMALLOC_HAVE_ATTR_DEPRECATED], [ ], [ ])
+  JE_CFLAGS_ADD([-Wdeprecated-declarations])
+  JE_CXXFLAGS_ADD([-Wdeprecated-declarations])
 fi
 
 dnl Check for VM_MAKE_TAG for mmap support.
@@ -1105,7 +1159,7 @@ AC_ARG_WITH([export],
 fi]
 )
 
-public_syms="aligned_alloc calloc dallocx free mallctl mallctlbymib mallctlnametomib malloc malloc_conf malloc_conf_2_conf_harder malloc_message malloc_stats_print malloc_usable_size mallocx smallocx_${jemalloc_version_gid} nallocx posix_memalign rallocx realloc sallocx sdallocx xallocx"
+public_syms="aligned_alloc calloc dallocx free free_sized free_aligned_sized mallctl mallctlbymib mallctlnametomib malloc malloc_conf malloc_conf_2_conf_harder malloc_message malloc_stats_print malloc_usable_size mallocx smallocx_${jemalloc_version_gid} nallocx posix_memalign rallocx realloc sallocx sdallocx xallocx"
 dnl Check for additional platform-specific public API functions.
 AC_CHECK_FUNC([memalign],
 	      [AC_DEFINE([JEMALLOC_OVERRIDE_MEMALIGN], [ ], [ ])
@@ -1129,6 +1183,16 @@ if test "x${JEMALLOC_PREFIX}" = "x" ; then
   AC_CHECK_FUNC([__libc_free],
 		[AC_DEFINE([JEMALLOC_OVERRIDE___LIBC_FREE], [ ], [ ])
 		 wrap_syms="${wrap_syms} __libc_free"])
+  dnl __libc_free_sized and __libc_free_aligned_sized are here speculatively
+  dnl under the assumption that glibc will eventually define symbols with these
+  dnl names. In the event glibc chooses different names for these symbols,
+  dnl these will need to be amended to match.
+  AC_CHECK_FUNC([__libc_free_sized],
+		[AC_DEFINE([JEMALLOC_OVERRIDE___LIBC_FREE_SIZED], [ ], [ ])
+		 wrap_syms="${wrap_syms} __libc_free_sized"])
+  AC_CHECK_FUNC([__libc_free_aligned_sized],
+		[AC_DEFINE([JEMALLOC_OVERRIDE___LIBC_FREE_ALIGNED_SIZED], [ ], [ ])
+		 wrap_syms="${wrap_syms} __libc_free_aligned_sized"])
   AC_CHECK_FUNC([__libc_malloc],
 		[AC_DEFINE([JEMALLOC_OVERRIDE___LIBC_MALLOC], [ ], [ ])
 		 wrap_syms="${wrap_syms} __libc_malloc"])
@@ -1384,6 +1448,33 @@ if test "x$backtrace_method" = "x" -a "x$enable_prof_libunwind" = "x1" ; then
   fi
 fi
 
+if test `uname -s` = "Linux"
+then
+  AC_ARG_ENABLE([prof-frameptr],
+    [AS_HELP_STRING([--enable-prof-frameptr], [Use optimized frame pointer unwinder for backtracing (Linux only)])],
+  [if test "x$enable_prof_frameptr" = "xno" ; then
+    enable_prof_frameptr="0"
+  else
+    enable_prof_frameptr="1"
+    if test "x$enable_prof" = "x0" ; then
+      AC_MSG_ERROR([--enable-prof-frameptr should only be used with --enable-prof])
+    fi
+  fi
+  ],
+  [enable_prof_frameptr="0"]
+  )
+  if test "x$backtrace_method" = "x" -a "x$enable_prof_frameptr" = "x1" \
+      -a "x$GCC" = "xyes" ; then
+    JE_CFLAGS_ADD([-fno-omit-frame-pointer])
+    backtrace_method="frame pointer linux"
+    AC_DEFINE([JEMALLOC_PROF_FRAME_POINTER], [ ], [ ])
+  else
+    enable_prof_frameptr="0"
+  fi
+else
+  enable_prof_frameptr="0"
+fi
+
 AC_ARG_ENABLE([prof-libgcc],
   [AS_HELP_STRING([--disable-prof-libgcc],
   [Do not use libgcc for backtracing])],
@@ -1459,6 +1550,18 @@ if test "x$zero_realloc_default_free" = "x1" ; then
   AC_DEFINE([JEMALLOC_ZERO_REALLOC_DEFAULT_FREE], [ ], [ ])
 fi
 
+dnl Support allocation from DSS by default
+AC_ARG_ENABLE([dss],
+  [AS_HELP_STRING([--disable-dss], [Disable usage of sbrk(2)])],
+[if test "x$enable_dss" = "xno" ; then
+  enable_dss="0"
+else
+  enable_dss="1"
+fi
+],
+[enable_dss="1"]
+)
+
 dnl Enable allocation from DSS if supported by the OS.
 have_dss="1"
 dnl Check whether the BSD/SUSv1 sbrk() exists.  If not, disable DSS support.
@@ -1472,7 +1575,7 @@ else
   have_dss="0"
 fi
 
-if test "x$have_dss" = "x1" ; then
+if test "x$have_dss" = "x1" -a "x$enable_dss" = "x1" ; then
   AC_DEFINE([JEMALLOC_DSS], [ ], [ ])
 fi
 
@@ -2023,6 +2126,16 @@ if test "x${je_cv_clock_realtime}" = "xyes" ; then
   AC_DEFINE([JEMALLOC_HAVE_CLOCK_REALTIME], [ ], [ ])
 fi
 
+dnl Check for clock_gettime_nsec_np().
+JE_COMPILABLE([clock_gettime_nsec_np()], [
+#include <time.h>
+], [
+	clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+], [je_cv_clock_gettime_nsec_np])
+if test "x${je_cv_clock_gettime_nsec_np}" = "xyes" ; then
+  AC_DEFINE([JEMALLOC_HAVE_CLOCK_GETTIME_NSEC_NP], [ ], [ ])
+fi
+
 dnl Use syscall(2) (if available) by default.
 AC_ARG_ENABLE([syscall],
   [AS_HELP_STRING([--disable-syscall], [Disable use of syscall(2)])],
@@ -2358,6 +2471,16 @@ if test "x${je_cv_madvise}" = "xyes" ; then
 	madvise((void *)0, 0, MADV_HUGEPAGE);
 	madvise((void *)0, 0, MADV_NOHUGEPAGE);
 ], [je_cv_thp])
+  case "${host_cpu}" in
+    arm*)
+      ;;
+    *)
+    if test "x${je_cv_thp}" = "xyes" ; then
+      AC_DEFINE([JEMALLOC_HAVE_MADVISE_HUGE], [ ], [ ])
+    fi
+    ;;
+  esac
+
   dnl Check for madvise(..., MADV_[NO]CORE).
   JE_COMPILABLE([madvise(..., MADV_[[NO]]CORE)], [
 #include <sys/mman.h>
@@ -2368,15 +2491,16 @@ if test "x${je_cv_madvise}" = "xyes" ; then
   if test "x${je_cv_madv_nocore}" = "xyes" ; then
     AC_DEFINE([JEMALLOC_MADVISE_NOCORE], [ ], [ ])
   fi
-case "${host_cpu}" in
-  arm*)
-    ;;
-  *)
-  if test "x${je_cv_thp}" = "xyes" ; then
-    AC_DEFINE([JEMALLOC_HAVE_MADVISE_HUGE], [ ], [ ])
+
+  dnl Check for madvise(..., MADV_COLLAPSE).
+  JE_COMPILABLE([madvise(..., MADV_COLLAPSE)], [
+#include <sys/mman.h>
+], [
+	madvise((void *)0, 0, MADV_COLLAPSE);
+], [je_cv_madv_collapse])
+  if test "x${je_cv_madv_collapse}" = "xyes" ; then
+    AC_DEFINE([JEMALLOC_HAVE_MADVISE_COLLAPSE], [ ], [ ])
   fi
-  ;;
-esac
 else
   dnl Check for posix_madvise.
   JE_COMPILABLE([posix_madvise], [
@@ -2501,7 +2625,7 @@ AC_SUBST([enable_initial_exec_tls])
 if test "x${je_cv_tls_model}" = "xyes" -a \
        "x${enable_initial_exec_tls}" = "x1" ; then
   AC_DEFINE([JEMALLOC_TLS_MODEL],
-            [__attribute__((tls_model("initial-exec")))], 
+            [__attribute__((tls_model("initial-exec")))],
             [ ])
 else
   AC_DEFINE([JEMALLOC_TLS_MODEL], [ ], [ ])
@@ -2580,6 +2704,15 @@ JE_COMPILABLE([pthreads adaptive mutexes], [
 ], [je_cv_pthread_mutex_adaptive_np])
 if test "x${je_cv_pthread_mutex_adaptive_np}" = "xyes" ; then
   AC_DEFINE([JEMALLOC_HAVE_PTHREAD_MUTEX_ADAPTIVE_NP], [ ], [ ])
+fi
+
+JE_COMPILABLE([gettid], [
+#include <unistd.h>
+], [
+  int tid = gettid();
+], [je_cv_gettid])
+if test "x${je_cv_gettid}" = "xyes" ; then
+  AC_DEFINE([JEMALLOC_HAVE_GETTID], [ ], [ ])
 fi
 
 JE_CFLAGS_SAVE()
@@ -2771,6 +2904,7 @@ AC_MSG_RESULT([stats              : ${enable_stats}])
 AC_MSG_RESULT([experimental_smallocx : ${enable_experimental_smallocx}])
 AC_MSG_RESULT([prof               : ${enable_prof}])
 AC_MSG_RESULT([prof-libunwind     : ${enable_prof_libunwind}])
+AC_MSG_RESULT([prof-frameptr      : ${enable_prof_frameptr}])
 AC_MSG_RESULT([prof-libgcc        : ${enable_prof_libgcc}])
 AC_MSG_RESULT([prof-gcc           : ${enable_prof_gcc}])
 AC_MSG_RESULT([fill               : ${enable_fill}])
@@ -2781,4 +2915,5 @@ AC_MSG_RESULT([lazy_lock          : ${enable_lazy_lock}])
 AC_MSG_RESULT([cache-oblivious    : ${enable_cache_oblivious}])
 AC_MSG_RESULT([pageid             : ${enable_pageid}])
 AC_MSG_RESULT([cxx                : ${enable_cxx}])
+AC_MSG_RESULT([dss                : ${enable_dss}])
 AC_MSG_RESULT([===============================================================================])

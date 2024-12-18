@@ -129,7 +129,7 @@ TEST_BEGIN(test_mdump_output_error) {
 TEST_END
 
 static int
-prof_dump_open_maps_error() {
+prof_dump_open_maps_error(void) {
 	return -1;
 }
 
@@ -166,6 +166,7 @@ expect_maps_write_failure(int count) {
 TEST_BEGIN(test_mdump_maps_error) {
 	test_skip_if(!config_prof);
 	test_skip_if(!config_debug);
+	test_skip_if(prof_dump_open_maps == NULL);
 
 	prof_dump_open_file_t *open_file_orig = prof_dump_open_file;
 	prof_dump_write_file_t *write_file_orig = prof_dump_write_file;
