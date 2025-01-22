@@ -110,8 +110,15 @@ TEST_BEGIN(test_retained) {
 	atomic_store_u(&epoch, 0, ATOMIC_RELAXED);
 
 	unsigned nthreads = ncpus * 2;
-	if (LG_SIZEOF_PTR < 3 && nthreads > 16) {
-		nthreads = 16; /* 32-bit platform could run out of vaddr. */
+	if (nthreads > 16) {
+		/*
+		 * Limit number of threads we are creating for following
+		 * reasons.
+		 * 1. On 32-bit platforms could run out of vaddr.
+		 * 2. On boxes with a lot of CPUs we might have not enough
+		 *    memory to fit thd_t into VARIABLE_ARRAY.
+		 */
+		nthreads = 16;
 	}
 	VARIABLE_ARRAY(thd_t, threads, nthreads);
 	for (unsigned i = 0; i < nthreads; i++) {
@@ -144,7 +151,6 @@ TEST_BEGIN(test_retained) {
 
 		arena_t *arena = arena_get(tsdn_fetch(), arena_ind, false);
 		size_t usable = 0;
-		size_t fragmented = 0;
 		for (pszind_t pind = sz_psz2ind(HUGEPAGE); pind <
 		    arena->pa_shard.pac.exp_grow.next; pind++) {
 			size_t psz = sz_pind2sz(pind);
@@ -158,7 +164,6 @@ TEST_BEGIN(test_retained) {
 				    "Excessive retained memory "
 				    "(%#zx[+%#zx] > %#zx)", usable, psz_usable,
 				    allocated);
-				fragmented += psz_fragmented;
 				usable += psz_usable;
 			}
 		}

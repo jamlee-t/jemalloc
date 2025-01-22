@@ -34,6 +34,7 @@ bool opt_prof_final = false;
 bool opt_prof_leak = false;
 bool opt_prof_leak_error = false;
 bool opt_prof_accum = false;
+bool opt_prof_pid_namespace = false;
 char opt_prof_prefix[PROF_DUMP_FILENAME_LEN];
 bool opt_prof_sys_thread_name = false;
 bool opt_prof_unbias = true;
@@ -73,16 +74,16 @@ static malloc_mutex_t next_thr_uid_mtx;
 bool prof_booted = false;
 
 /* Logically a prof_backtrace_hook_t. */
-atomic_p_t prof_backtrace_hook;
+static atomic_p_t prof_backtrace_hook;
 
 /* Logically a prof_dump_hook_t. */
-atomic_p_t prof_dump_hook;
+static atomic_p_t prof_dump_hook;
 
 /* Logically a prof_sample_hook_t. */
-atomic_p_t prof_sample_hook;
+static atomic_p_t prof_sample_hook;
 
 /* Logically a prof_sample_free_hook_t. */
-atomic_p_t prof_sample_free_hook;
+static atomic_p_t prof_sample_free_hook;
 
 /******************************************************************************/
 
@@ -91,11 +92,19 @@ prof_alloc_rollback(tsd_t *tsd, prof_tctx_t *tctx) {
 	cassert(config_prof);
 
 	if (tsd_reentrancy_level_get(tsd) > 0) {
-		assert((uintptr_t)tctx == (uintptr_t)1U);
+		assert(tctx == PROF_TCTX_SENTINEL);
 		return;
 	}
 
-	if ((uintptr_t)tctx > (uintptr_t)1U) {
+	if (prof_tctx_is_valid(tctx)) {
+		/*
+		 * This `assert` really shouldn't be necessary. It's here
+		 * because there's a bug in the clang static analyzer; it
+		 * somehow does not realize that by `prof_tctx_is_valid(tctx)`
+		 * being true that we've already ensured that `tctx` is not
+		 * `NULL`.
+		 */
+		assert(tctx != NULL);
 		malloc_mutex_lock(tsd_tsdn(tsd), tctx->tdata->lock);
 		tctx->prepared = false;
 		prof_tctx_try_destroy(tsd, tctx);
@@ -157,7 +166,7 @@ prof_malloc_sample_object(tsd_t *tsd, const void *ptr, size_t size,
 	if (prof_sample_hook != NULL) {
 		prof_bt_t *bt = &tctx->gctx->bt;
 		pre_reentrancy(tsd, NULL);
-		prof_sample_hook(ptr, size, bt->vec, bt->len);
+		prof_sample_hook(ptr, size, bt->vec, bt->len, usize);
 		post_reentrancy(tsd);
 	}
 }
@@ -169,7 +178,7 @@ prof_free_sampled_object(tsd_t *tsd, const void *ptr, size_t usize,
 
 	assert(prof_info != NULL);
 	prof_tctx_t *tctx = prof_info->alloc_tctx;
-	assert((uintptr_t)tctx > (uintptr_t)1U);
+	assert(prof_tctx_is_valid(tctx));
 
 	szind_t szind = sz_size2index(usize);
 
@@ -269,7 +278,8 @@ prof_sample_new_event_wait(tsd_t *tsd) {
 	 * otherwise bytes_until_sample would be 0 if u is exactly 1.0.
 	 */
 	uint64_t r = prng_lg_range_u64(tsd_prng_statep_get(tsd), 53);
-	double u = (r == 0U) ? 1.0 : (double)r * (1.0/9007199254740992.0L);
+	double u = (r == 0U) ? 1.0 : (double)((long double)r *
+	    (1.0L/9007199254740992.0L));
 	return (uint64_t)(log(u) /
 	    log(1.0 - (1.0 / (double)((uint64_t)1U << lg_prof_sample))))
 	    + (uint64_t)1U;
@@ -562,7 +572,7 @@ prof_backtrace_hook_set(prof_backtrace_hook_t hook) {
 }
 
 prof_backtrace_hook_t
-prof_backtrace_hook_get() {
+prof_backtrace_hook_get(void) {
 	return (prof_backtrace_hook_t)atomic_load_p(&prof_backtrace_hook,
 	    ATOMIC_ACQUIRE);
 }
@@ -573,7 +583,7 @@ prof_dump_hook_set(prof_dump_hook_t hook) {
 }
 
 prof_dump_hook_t
-prof_dump_hook_get() {
+prof_dump_hook_get(void) {
 	return (prof_dump_hook_t)atomic_load_p(&prof_dump_hook,
 	    ATOMIC_ACQUIRE);
 }
@@ -584,7 +594,7 @@ prof_sample_hook_set(prof_sample_hook_t hook) {
 }
 
 prof_sample_hook_t
-prof_sample_hook_get() {
+prof_sample_hook_get(void) {
 	return (prof_sample_hook_t)atomic_load_p(&prof_sample_hook,
 	    ATOMIC_ACQUIRE);
 }
@@ -595,7 +605,7 @@ prof_sample_free_hook_set(prof_sample_free_hook_t hook) {
 }
 
 prof_sample_free_hook_t
-prof_sample_free_hook_get() {
+prof_sample_free_hook_get(void) {
 	return (prof_sample_free_hook_t)atomic_load_p(&prof_sample_free_hook,
 	    ATOMIC_ACQUIRE);
 }

@@ -1,15 +1,25 @@
 #ifndef JEMALLOC_INTERNAL_BACKGROUND_THREAD_INLINES_H
 #define JEMALLOC_INTERNAL_BACKGROUND_THREAD_INLINES_H
 
+#include "jemalloc/internal/jemalloc_preamble.h"
+#include "jemalloc/internal/arena_inlines_a.h"
+#include "jemalloc/internal/atomic.h"
+#include "jemalloc/internal/background_thread_externs.h"
+
 JEMALLOC_ALWAYS_INLINE bool
 background_thread_enabled(void) {
 	return atomic_load_b(&background_thread_enabled_state, ATOMIC_RELAXED);
 }
 
 JEMALLOC_ALWAYS_INLINE void
+background_thread_enabled_set_impl(bool state) {
+	atomic_store_b(&background_thread_enabled_state, state, ATOMIC_RELAXED);
+}
+
+JEMALLOC_ALWAYS_INLINE void
 background_thread_enabled_set(tsdn_t *tsdn, bool state) {
 	malloc_mutex_assert_owner(tsdn, &background_thread_lock);
-	atomic_store_b(&background_thread_enabled_state, state, ATOMIC_RELAXED);
+	background_thread_enabled_set_impl(state);
 }
 
 JEMALLOC_ALWAYS_INLINE background_thread_info_t *
