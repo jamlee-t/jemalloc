@@ -1,6 +1,9 @@
 #ifndef JEMALLOC_INTERNAL_RB_H
 #define JEMALLOC_INTERNAL_RB_H
 
+#include "jemalloc/internal/jemalloc_preamble.h"
+#include "jemalloc/internal/safety_check.h"
+
 /*-
  *******************************************************************************
  *
@@ -867,6 +870,7 @@ a_prefix##remove(a_rbt_type *rbtree, a_type *node) {			\
 	}								\
     }									\
     rb_remove_safety_checks(nodep, __func__);				\
+    assert(nodep != NULL);                                              \
     assert(nodep->node == node);					\
     pathp--;								\
     if (pathp->node != node) {						\

@@ -1,9 +1,14 @@
 #ifndef JEMALLOC_INTERNAL_HPA_H
 #define JEMALLOC_INTERNAL_HPA_H
 
+#include "jemalloc/internal/jemalloc_preamble.h"
+#include "jemalloc/internal/base.h"
+#include "jemalloc/internal/edata_cache.h"
+#include "jemalloc/internal/emap.h"
 #include "jemalloc/internal/exp_grow.h"
 #include "jemalloc/internal/hpa_hooks.h"
 #include "jemalloc/internal/hpa_opts.h"
+#include "jemalloc/internal/mutex.h"
 #include "jemalloc/internal/pai.h"
 #include "jemalloc/internal/psset.h"
 
@@ -56,6 +61,14 @@ struct hpa_shard_nonderived_stats_s {
 	 * Guarded by mtx.
 	 */
 	uint64_t nhugifies;
+
+	/*
+	 * The number of times we've tried to hugify a pageslab, but failed.
+	 *
+	 * Guarded by mtx.
+	 */
+	uint64_t nhugify_failures;
+
 	/*
 	 * The number of times we've dehugified a pageslab.
 	 *
@@ -138,12 +151,13 @@ struct hpa_shard_s {
 	nstime_t last_purge;
 };
 
+bool hpa_hugepage_size_exceeds_limit();
 /*
  * Whether or not the HPA can be used given the current configuration.  This is
  * is not necessarily a guarantee that it backs its allocations by hugepages,
  * just that it can function properly given the system it's running on.
  */
-bool hpa_supported();
+bool hpa_supported(void);
 bool hpa_central_init(hpa_central_t *central, base_t *base, const hpa_hooks_t *hooks);
 bool hpa_shard_init(hpa_shard_t *shard, hpa_central_t *central, emap_t *emap,
     base_t *base, edata_cache_t *edata_cache, unsigned ind,

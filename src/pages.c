@@ -17,11 +17,11 @@
 #include <sys/bitops.h>	/* ilog2 */
 #endif
 #ifdef JEMALLOC_HAVE_VM_MAKE_TAG
-#define PAGES_FD_TAG VM_MAKE_TAG(101U)
+#define PAGES_FD_TAG VM_MAKE_TAG(254U)
 #else
 #define PAGES_FD_TAG -1
 #endif
-#ifdef JEMALLOC_HAVE_PRCTL
+#if defined(JEMALLOC_HAVE_PRCTL) && defined(JEMALLOC_PAGEID)
 #include <sys/prctl.h>
 #ifndef PR_SET_VMA
 #define PR_SET_VMA 0x53564d41
@@ -33,7 +33,7 @@
 /* Data. */
 
 /* Actual operating system page size, detected during bootstrap, <= PAGE. */
-static size_t	os_page;
+size_t	os_page;
 
 #ifndef _WIN32
 #  define PAGES_PROT_COMMIT (PROT_READ | PROT_WRITE)
@@ -42,7 +42,7 @@ static int	mmap_flags;
 #endif
 static bool	os_overcommits;
 
-const char *thp_mode_names[] = {
+const char *const thp_mode_names[] = {
 	"default",
 	"always",
 	"never",
@@ -66,7 +66,7 @@ static int madvise_dont_need_zeros_is_faulty = -1;
  *
  *   [1]: https://patchwork.kernel.org/patch/10576637/
  */
-static int madvise_MADV_DONTNEED_zeroes_pages()
+static int madvise_MADV_DONTNEED_zeroes_pages(void)
 {
 	size_t size = PAGE;
 
@@ -197,7 +197,7 @@ os_pages_map(void *addr, size_t size, size_t alignment, bool *commit) {
 static void *
 os_pages_trim(void *addr, size_t alloc_size, size_t leadsize, size_t size,
     bool *commit) {
-	void *ret = (void *)((uintptr_t)addr + leadsize);
+	void *ret = (void *)((byte_t *)addr + leadsize);
 
 	assert(alloc_size >= leadsize + size);
 #ifdef _WIN32
@@ -217,7 +217,7 @@ os_pages_trim(void *addr, size_t alloc_size, size_t leadsize, size_t size,
 		os_pages_unmap(addr, leadsize);
 	}
 	if (trailsize != 0) {
-		os_pages_unmap((void *)((uintptr_t)ret + size), trailsize);
+		os_pages_unmap((void *)((byte_t *)ret + size), trailsize);
 	}
 	return ret;
 #endif
@@ -568,6 +568,30 @@ pages_nohuge_unaligned(void *addr, size_t size) {
 }
 
 bool
+pages_collapse(void *addr, size_t size) {
+	assert(PAGE_ADDR2BASE(addr) == addr);
+	assert(PAGE_CEILING(size) == size);
+	/*
+	 * There is one more MADV_COLLAPSE precondition that is not easy to
+	 * express with assert statement.  In order to madvise(addr, size,
+	 * MADV_COLLAPSE) call to be successful, at least one page in the range
+	 * must currently be backed by physical memory.  In particularly, this
+	 * means we can't call pages_collapse on freshly mapped memory region.
+	 * See madvise(2) man page for more details.
+	 */
+#if defined(JEMALLOC_HAVE_MADVISE_COLLAPSE) && \
+    (defined(MADV_COLLAPSE) || defined(JEMALLOC_MADV_COLLAPSE))
+#  if defined(MADV_COLLAPSE)
+	return (madvise(addr, size, MADV_COLLAPSE) != 0);
+#  elif defined(JEMALLOC_MADV_COLLAPSE)
+	return (madvise(addr, size, JEMALLOC_MADV_COLLAPSE) != 0);
+#  endif
+#else
+	return true;
+#endif
+}
+
+bool
 pages_dontdump(void *addr, size_t size) {
 	assert(PAGE_ADDR2BASE(addr) == addr);
 	assert(PAGE_CEILING(size) == size);
@@ -651,36 +675,13 @@ os_overcommits_proc(void) {
 	int fd;
 	char buf[1];
 
-#if defined(JEMALLOC_USE_SYSCALL) && defined(SYS_open)
-	#if defined(O_CLOEXEC)
-		fd = (int)syscall(SYS_open, "/proc/sys/vm/overcommit_memory", O_RDONLY |
-			O_CLOEXEC);
-	#else
-		fd = (int)syscall(SYS_open, "/proc/sys/vm/overcommit_memory", O_RDONLY);
-		if (fd != -1) {
-			fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
-		}
-	#endif
-#elif defined(JEMALLOC_USE_SYSCALL) && defined(SYS_openat)
-	#if defined(O_CLOEXEC)
-		fd = (int)syscall(SYS_openat,
-			AT_FDCWD, "/proc/sys/vm/overcommit_memory", O_RDONLY | O_CLOEXEC);
-	#else
-		fd = (int)syscall(SYS_openat,
-			AT_FDCWD, "/proc/sys/vm/overcommit_memory", O_RDONLY);
-		if (fd != -1) {
-			fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
-		}
-	#endif
+#if defined(O_CLOEXEC)
+	fd = malloc_open("/proc/sys/vm/overcommit_memory", O_RDONLY | O_CLOEXEC);
 #else
-	#if defined(O_CLOEXEC)
-		fd = open("/proc/sys/vm/overcommit_memory", O_RDONLY | O_CLOEXEC);
-	#else
-		fd = open("/proc/sys/vm/overcommit_memory", O_RDONLY);
-		if (fd != -1) {
-			fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
-		}
-	#endif
+	fd = malloc_open("/proc/sys/vm/overcommit_memory", O_RDONLY);
+	if (fd != -1) {
+		fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
+	}
 #endif
 
 	if (fd == -1) {
@@ -688,11 +689,7 @@ os_overcommits_proc(void) {
 	}
 
 	ssize_t nread = malloc_read_fd(fd, &buf, sizeof(buf));
-#if defined(JEMALLOC_USE_SYSCALL) && defined(SYS_close)
-	syscall(SYS_close, fd);
-#else
-	close(fd);
-#endif
+	malloc_close(fd);
 
 	if (nread < 1) {
 		return false; /* Error. */
@@ -741,29 +738,17 @@ init_thp_state(void) {
 	static const char sys_state_never[] = "always madvise [never]\n";
 	char buf[sizeof(sys_state_madvise)];
 
-#if defined(JEMALLOC_USE_SYSCALL) && defined(SYS_open)
-	int fd = (int)syscall(SYS_open,
+	int fd = malloc_open(
 	    "/sys/kernel/mm/transparent_hugepage/enabled", O_RDONLY);
-#elif defined(JEMALLOC_USE_SYSCALL) && defined(SYS_openat)
-	int fd = (int)syscall(SYS_openat,
-		    AT_FDCWD, "/sys/kernel/mm/transparent_hugepage/enabled", O_RDONLY);
-#else
-	int fd = open("/sys/kernel/mm/transparent_hugepage/enabled", O_RDONLY);
-#endif
 	if (fd == -1) {
 		goto label_error;
 	}
 
 	ssize_t nread = malloc_read_fd(fd, &buf, sizeof(buf));
-#if defined(JEMALLOC_USE_SYSCALL) && defined(SYS_close)
-	syscall(SYS_close, fd);
-#else
-	close(fd);
-#endif
-
-        if (nread < 0) {
+	malloc_close(fd);
+	if (nread < 0) {
 		goto label_error;
-        }
+	}
 
 	if (strncmp(buf, sys_state_madvise, (size_t)nread) == 0) {
 		init_system_thp_mode = thp_mode_default;

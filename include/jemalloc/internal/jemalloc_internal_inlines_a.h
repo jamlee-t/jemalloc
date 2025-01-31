@@ -1,10 +1,14 @@
 #ifndef JEMALLOC_INTERNAL_INLINES_A_H
 #define JEMALLOC_INTERNAL_INLINES_A_H
 
+#include "jemalloc/internal/jemalloc_preamble.h"
+#include "jemalloc/internal/arena_externs.h"
+#include "jemalloc/internal/arena_types.h"
 #include "jemalloc/internal/atomic.h"
 #include "jemalloc/internal/bit_util.h"
 #include "jemalloc/internal/jemalloc_internal_types.h"
 #include "jemalloc/internal/sc.h"
+#include "jemalloc/internal/tcache_externs.h"
 #include "jemalloc/internal/ticker.h"
 
 JEMALLOC_ALWAYS_INLINE malloc_cpuid_t
@@ -15,9 +19,9 @@ malloc_getcpu(void) {
 #elif defined(JEMALLOC_HAVE_SCHED_GETCPU)
 	return (malloc_cpuid_t)sched_getcpu();
 #elif defined(JEMALLOC_HAVE_RDTSCP)
-	unsigned int ax, cx, dx;
-	asm volatile("rdtscp" : "=a"(ax), "=d"(dx), "=c"(cx) ::);
-	return (malloc_cpuid_t)(dx & 0xfff);
+	unsigned int ecx;
+	asm volatile("rdtscp" : "=c" (ecx) :: "eax", "edx");
+	return (malloc_cpuid_t)(ecx & 0xfff);
 #elif defined(__aarch64__) && defined(__APPLE__)
 	/* Other oses most likely use tpidr_el0 instead */
 	uintptr_t c;

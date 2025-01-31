@@ -1,6 +1,9 @@
 #ifndef JEMALLOC_INTERNAL_NSTIME_H
 #define JEMALLOC_INTERNAL_NSTIME_H
 
+#include "jemalloc/internal/jemalloc_preamble.h"
+#include "jemalloc/internal/assert.h"
+
 /* Maximum supported number of seconds (~584 years). */
 #define NSTIME_SEC_MAX KQU(18446744072)
 
@@ -23,8 +26,8 @@ static const nstime_t nstime_zero = NSTIME_ZERO_INITIALIZER;
 void nstime_init(nstime_t *time, uint64_t ns);
 void nstime_init2(nstime_t *time, uint64_t sec, uint64_t nsec);
 uint64_t nstime_ns(const nstime_t *time);
+uint64_t nstime_ms(const nstime_t *time);
 uint64_t nstime_sec(const nstime_t *time);
-uint64_t nstime_msec(const nstime_t *time);
 uint64_t nstime_nsec(const nstime_t *time);
 void nstime_copy(nstime_t *time, const nstime_t *source);
 int nstime_compare(const nstime_t *a, const nstime_t *b);
@@ -36,6 +39,7 @@ void nstime_imultiply(nstime_t *time, uint64_t multiplier);
 void nstime_idivide(nstime_t *time, uint64_t divisor);
 uint64_t nstime_divide(const nstime_t *time, const nstime_t *divisor);
 uint64_t nstime_ns_since(const nstime_t *past);
+uint64_t nstime_ms_since(const nstime_t *past);
 
 typedef bool (nstime_monotonic_t)(void);
 extern nstime_monotonic_t *JET_MUTABLE nstime_monotonic;
@@ -56,7 +60,7 @@ enum prof_time_res_e {
 typedef enum prof_time_res_e prof_time_res_t;
 
 extern prof_time_res_t opt_prof_time_res;
-extern const char *prof_time_res_mode_names[];
+extern const char *const prof_time_res_mode_names[];
 
 JEMALLOC_ALWAYS_INLINE void
 nstime_init_zero(nstime_t *time) {

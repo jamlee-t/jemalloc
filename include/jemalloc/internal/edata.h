@@ -1,12 +1,14 @@
 #ifndef JEMALLOC_INTERNAL_EDATA_H
 #define JEMALLOC_INTERNAL_EDATA_H
 
+#include "jemalloc/internal/jemalloc_preamble.h"
 #include "jemalloc/internal/atomic.h"
 #include "jemalloc/internal/bin_info.h"
 #include "jemalloc/internal/bit_util.h"
 #include "jemalloc/internal/hpdata.h"
 #include "jemalloc/internal/nstime.h"
 #include "jemalloc/internal/ph.h"
+#include "jemalloc/internal/prof_types.h"
 #include "jemalloc/internal/ql.h"
 #include "jemalloc/internal/sc.h"
 #include "jemalloc/internal/slab_data.h"
@@ -375,18 +377,18 @@ edata_ps_get(const edata_t *edata) {
 
 static inline void *
 edata_before_get(const edata_t *edata) {
-	return (void *)((uintptr_t)edata_base_get(edata) - PAGE);
+	return (void *)((byte_t *)edata_base_get(edata) - PAGE);
 }
 
 static inline void *
 edata_last_get(const edata_t *edata) {
-	return (void *)((uintptr_t)edata_base_get(edata) +
+	return (void *)((byte_t *)edata_base_get(edata) +
 	    edata_size_get(edata) - PAGE);
 }
 
 static inline void *
 edata_past_get(const edata_t *edata) {
-	return (void *)((uintptr_t)edata_base_get(edata) +
+	return (void *)((byte_t *)edata_base_get(edata) +
 	    edata_size_get(edata));
 }
 
@@ -619,7 +621,8 @@ edata_init(edata_t *edata, unsigned arena_ind, void *addr, size_t size,
 }
 
 static inline void
-edata_binit(edata_t *edata, void *addr, size_t bsize, uint64_t sn) {
+edata_binit(edata_t *edata, void *addr, size_t bsize, uint64_t sn,
+    bool reused) {
 	edata_arena_ind_set(edata, (1U << MALLOCX_ARENA_BITS) - 1);
 	edata_addr_set(edata, addr);
 	edata_bsize_set(edata, bsize);
@@ -627,7 +630,8 @@ edata_binit(edata_t *edata, void *addr, size_t bsize, uint64_t sn) {
 	edata_szind_set(edata, SC_NSIZES);
 	edata_sn_set(edata, sn);
 	edata_state_set(edata, extent_state_active);
-	edata_guarded_set(edata, false);
+	/* See comments in base_edata_is_reused. */
+	edata_guarded_set(edata, reused);
 	edata_zeroed_set(edata, true);
 	edata_committed_set(edata, true);
 	/*
@@ -662,6 +666,21 @@ edata_cmp_summary_get(const edata_t *edata) {
 	return result;
 }
 
+#ifdef JEMALLOC_HAVE_INT128
+JEMALLOC_ALWAYS_INLINE unsigned __int128
+edata_cmp_summary_encode(edata_cmp_summary_t src) {
+	return ((unsigned __int128)src.sn << 64) | src.addr;
+}
+
+static inline int
+edata_cmp_summary_comp(edata_cmp_summary_t a, edata_cmp_summary_t b) {
+    unsigned __int128 a_encoded = edata_cmp_summary_encode(a);
+    unsigned __int128 b_encoded = edata_cmp_summary_encode(b);
+    if (a_encoded < b_encoded) return -1;
+    if (a_encoded == b_encoded) return 0;
+    return 1;
+}
+#else
 static inline int
 edata_cmp_summary_comp(edata_cmp_summary_t a, edata_cmp_summary_t b) {
 	/*
@@ -679,6 +698,7 @@ edata_cmp_summary_comp(edata_cmp_summary_t a, edata_cmp_summary_t b) {
 	return (2 * ((a.sn > b.sn) - (a.sn < b.sn))) +
 	       ((a.addr > b.addr) - (a.addr < b.addr));
 }
+#endif
 
 static inline int
 edata_snad_comp(const edata_t *a, const edata_t *b) {

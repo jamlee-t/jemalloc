@@ -53,7 +53,7 @@ ehooks_default_alloc_impl(tsdn_t *tsdn, void *new_addr, size_t size,
     size_t alignment, bool *zero, bool *commit, unsigned arena_ind) {
 	arena_t *arena = arena_get(tsdn, arena_ind, false);
 	/* NULL arena indicates arena_create. */
-	assert(arena != NULL || alignment == HUGEPAGE);
+	assert(arena != NULL || alignment == BASE_BLOCK_MIN_ALIGN);
 	dss_prec_t dss = (arena == NULL) ? dss_prec_disabled :
 	    (dss_prec_t)atomic_load_u(&arena->dss_prec, ATOMIC_RELAXED);
 	void *ret = extent_alloc_core(tsdn, arena, new_addr, size, alignment,
@@ -100,7 +100,7 @@ ehooks_default_destroy(extent_hooks_t *extent_hooks, void *addr, size_t size,
 
 bool
 ehooks_default_commit_impl(void *addr, size_t offset, size_t length) {
-	return pages_commit((void *)((uintptr_t)addr + (uintptr_t)offset),
+	return pages_commit((void *)((byte_t *)addr + (uintptr_t)offset),
 	    length);
 }
 
@@ -112,7 +112,7 @@ ehooks_default_commit(extent_hooks_t *extent_hooks, void *addr, size_t size,
 
 bool
 ehooks_default_decommit_impl(void *addr, size_t offset, size_t length) {
-	return pages_decommit((void *)((uintptr_t)addr + (uintptr_t)offset),
+	return pages_decommit((void *)((byte_t *)addr + (uintptr_t)offset),
 	    length);
 }
 
@@ -125,7 +125,7 @@ ehooks_default_decommit(extent_hooks_t *extent_hooks, void *addr, size_t size,
 #ifdef PAGES_CAN_PURGE_LAZY
 bool
 ehooks_default_purge_lazy_impl(void *addr, size_t offset, size_t length) {
-	return pages_purge_lazy((void *)((uintptr_t)addr + (uintptr_t)offset),
+	return pages_purge_lazy((void *)((byte_t *)addr + (uintptr_t)offset),
 	    length);
 }
 
@@ -143,7 +143,7 @@ ehooks_default_purge_lazy(extent_hooks_t *extent_hooks, void *addr, size_t size,
 #ifdef PAGES_CAN_PURGE_FORCED
 bool
 ehooks_default_purge_forced_impl(void *addr, size_t offset, size_t length) {
-	return pages_purge_forced((void *)((uintptr_t)addr +
+	return pages_purge_forced((void *)((byte_t *)addr +
 	    (uintptr_t)offset), length);
 }
 
@@ -159,7 +159,7 @@ ehooks_default_purge_forced(extent_hooks_t *extent_hooks, void *addr,
 #endif
 
 bool
-ehooks_default_split_impl() {
+ehooks_default_split_impl(void) {
 	if (!maps_coalesce) {
 		/*
 		 * Without retain, only whole regions can be purged (required by

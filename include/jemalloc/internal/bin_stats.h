@@ -1,6 +1,7 @@
 #ifndef JEMALLOC_INTERNAL_BIN_STATS_H
 #define JEMALLOC_INTERNAL_BIN_STATS_H
 
+#include "jemalloc/internal/jemalloc_preamble.h"
 #include "jemalloc/internal/mutex_prof.h"
 
 typedef struct bin_stats_s bin_stats_t;
@@ -47,6 +48,11 @@ struct bin_stats_s {
 
 	/* Current size of nonfull slabs heap in this bin. */
 	size_t		nonfull_slabs;
+
+	uint64_t	batch_pops;
+	uint64_t	batch_failed_pushes;
+	uint64_t	batch_pushes;
+	uint64_t	batch_pushed_elems;
 };
 
 typedef struct bin_stats_data_s bin_stats_data_t;

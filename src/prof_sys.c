@@ -1,9 +1,9 @@
-#define JEMALLOC_PROF_SYS_C_
 #include "jemalloc/internal/jemalloc_preamble.h"
 #include "jemalloc/internal/jemalloc_internal_includes.h"
 
 #include "jemalloc/internal/buf_writer.h"
 #include "jemalloc/internal/ctl.h"
+#include "jemalloc/internal/malloc_io.h"
 #include "jemalloc/internal/prof_data.h"
 #include "jemalloc/internal/prof_sys.h"
 
@@ -26,8 +26,6 @@
 /******************************************************************************/
 
 malloc_mutex_t prof_dump_filename_mtx;
-
-bool prof_do_mock = false;
 
 static uint64_t prof_dump_seq;
 static uint64_t prof_dump_iseq;
@@ -101,7 +99,48 @@ prof_backtrace_impl(void **vec, unsigned *len, unsigned max_len) {
 
 	_Unwind_Backtrace(prof_unwind_callback, &data);
 }
+#elif (defined(JEMALLOC_PROF_FRAME_POINTER))
+JEMALLOC_DIAGNOSTIC_PUSH
+JEMALLOC_DIAGNOSTIC_IGNORE_FRAME_ADDRESS
+static void
+prof_backtrace_impl(void **vec, unsigned *len, unsigned max_len) {
+  // stack_start - highest possible valid stack address (assumption: stacks grow downward)
+  //   stack_end - current stack frame and lowest possible valid stack address
+  //               (all earlier frames will be at higher addresses than this)
+
+  // always safe to get the current stack frame address
+  void** stack_end = (void**)__builtin_frame_address(0);
+  if (stack_end == NULL) {
+    *len = 0;
+    return;
+  }
+
+  static __thread void **stack_start = (void **)0;  // thread local
+  if (stack_start == 0 || stack_end >= stack_start) {
+    stack_start = (void**)prof_thread_stack_start((uintptr_t)stack_end);
+  }
+
+  if (stack_start == 0 || stack_end >= stack_start) {
+    *len = 0;
+    return;
+  }
+
+  unsigned ii = 0;
+  void** fp = (void**)stack_end;
+  while (fp < stack_start && ii < max_len) {
+    vec[ii++] = fp[1];
+    void** fp_prev = fp;
+    fp = fp[0];
+    if (unlikely(fp <= fp_prev)) { // sanity check forward progress
+      break;
+    }
+  }
+  *len = ii;
+}
+JEMALLOC_DIAGNOSTIC_POP
 #elif (defined(JEMALLOC_PROF_GCC))
+JEMALLOC_DIAGNOSTIC_PUSH
+JEMALLOC_DIAGNOSTIC_IGNORE_FRAME_ADDRESS
 static void
 prof_backtrace_impl(void **vec, unsigned *len, unsigned max_len) {
 /* The input arg must be a constant for __builtin_return_address. */
@@ -407,6 +446,7 @@ prof_backtrace_impl(void **vec, unsigned *len, unsigned max_len) {
 	BT_FRAME(254)
 	BT_FRAME(255)
 #undef BT_FRAME
+JEMALLOC_DIAGNOSTIC_POP
 }
 #else
 static void
@@ -428,7 +468,7 @@ prof_backtrace(tsd_t *tsd, prof_bt_t *bt) {
 }
 
 void
-prof_hooks_init() {
+prof_hooks_init(void) {
 	prof_backtrace_hook_set(&prof_backtrace_impl);
 	prof_dump_hook_set(NULL);
 	prof_sample_hook_set(NULL);
@@ -436,7 +476,7 @@ prof_hooks_init() {
 }
 
 void
-prof_unwind_init() {
+prof_unwind_init(void) {
 #ifdef JEMALLOC_PROF_LIBGCC
 	/*
 	 * Cause the backtracing machinery to allocate its internal
@@ -482,6 +522,41 @@ prof_getpid(void) {
 #else
 	return getpid();
 #endif
+}
+
+static long
+prof_get_pid_namespace() {
+	long ret = 0;
+
+#if defined(_WIN32) || defined(__APPLE__)
+	// Not supported, do nothing.
+#else
+	char buf[PATH_MAX];
+	const char* linkname =
+#  if defined(__FreeBSD__) || defined(__DragonFly__)
+	    "/proc/curproc/ns/pid"
+#  else
+	    "/proc/self/ns/pid"
+#  endif
+	    ;
+	ssize_t linklen =
+#  ifndef JEMALLOC_READLINKAT
+	readlink(linkname, buf, PATH_MAX)
+#  else
+	readlinkat(AT_FDCWD, linkname, buf, PATH_MAX)
+#  endif
+	    ;
+
+	// namespace string is expected to be like pid:[4026531836]
+	if (linklen > 0) {
+		// Trim the trailing "]"
+		buf[linklen-1] = '\0';
+		char* index = strtok(buf, "pid:[");
+		ret = atol(index);
+	}
+#endif
+
+  return ret;
 }
 
 /*
@@ -570,6 +645,72 @@ prof_dump_close(prof_dump_arg_t *arg) {
 	}
 }
 
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+
+#ifdef __LP64__
+typedef struct mach_header_64 mach_header_t;
+typedef struct segment_command_64 segment_command_t;
+#define MH_MAGIC_VALUE MH_MAGIC_64
+#define MH_CIGAM_VALUE MH_CIGAM_64
+#define LC_SEGMENT_VALUE LC_SEGMENT_64
+#else
+typedef struct mach_header mach_header_t;
+typedef struct segment_command segment_command_t;
+#define MH_MAGIC_VALUE MH_MAGIC
+#define MH_CIGAM_VALUE MH_CIGAM
+#define LC_SEGMENT_VALUE LC_SEGMENT
+#endif
+
+static void
+prof_dump_dyld_image_vmaddr(buf_writer_t *buf_writer, uint32_t image_index) {
+	const mach_header_t *header = (const mach_header_t *)
+	    _dyld_get_image_header(image_index);
+	if (header == NULL || (header->magic != MH_MAGIC_VALUE &&
+	    header->magic != MH_CIGAM_VALUE)) {
+		// Invalid header
+		return;
+	}
+
+	intptr_t slide = _dyld_get_image_vmaddr_slide(image_index);
+	const char *name = _dyld_get_image_name(image_index);
+	struct load_command *load_cmd = (struct load_command *)
+	    ((char *)header + sizeof(mach_header_t));
+	for (uint32_t i = 0; load_cmd && (i < header->ncmds); i++) {
+		if (load_cmd->cmd == LC_SEGMENT_VALUE) {
+			const segment_command_t *segment_cmd =
+			    (const segment_command_t *)load_cmd;
+			if (!strcmp(segment_cmd->segname, "__TEXT")) {
+				char buffer[PATH_MAX + 1];
+				malloc_snprintf(buffer, sizeof(buffer),
+				    "%016llx-%016llx: %s\n", segment_cmd->vmaddr + slide,
+				    segment_cmd->vmaddr + slide + segment_cmd->vmsize, name);
+				buf_writer_cb(buf_writer, buffer);
+				return;
+			}
+		}
+		load_cmd =
+		    (struct load_command *)((char *)load_cmd + load_cmd->cmdsize);
+	}
+}
+
+static void
+prof_dump_dyld_maps(buf_writer_t *buf_writer) {
+	uint32_t image_count = _dyld_image_count();
+	for (uint32_t i = 0; i < image_count; i++) {
+		prof_dump_dyld_image_vmaddr(buf_writer, i);
+	}
+}
+
+prof_dump_open_maps_t *JET_MUTABLE prof_dump_open_maps = NULL;
+
+static void
+prof_dump_maps(buf_writer_t *buf_writer) {
+	buf_writer_cb(buf_writer, "\nMAPPED_LIBRARIES:\n");
+	/* No proc map file to read on MacOS, dump dyld maps for backtrace. */
+	prof_dump_dyld_maps(buf_writer);
+}
+#else /* !__APPLE__ */
 #ifndef _WIN32
 JEMALLOC_FORMAT_PRINTF(1, 2)
 static int
@@ -596,7 +737,7 @@ prof_open_maps_internal(const char *format, ...) {
 #endif
 
 static int
-prof_dump_open_maps_impl() {
+prof_dump_open_maps_impl(void) {
 	int mfd;
 
 	cassert(config_prof);
@@ -635,6 +776,7 @@ prof_dump_maps(buf_writer_t *buf_writer) {
 	buf_writer_pipe(buf_writer, prof_dump_read_maps_cb, &mfd);
 	close(mfd);
 }
+#endif /* __APPLE__ */
 
 static bool
 prof_dump(tsd_t *tsd, bool propagate_err, const char *filename,
@@ -713,15 +855,30 @@ prof_dump_filename(tsd_t *tsd, char *filename, char v, uint64_t vseq) {
 	const char *prefix = prof_prefix_get(tsd_tsdn(tsd));
 
 	if (vseq != VSEQ_INVALID) {
-	        /* "<prefix>.<pid>.<seq>.v<vseq>.heap" */
-		malloc_snprintf(filename, DUMP_FILENAME_BUFSIZE,
-		    "%s.%d.%"FMTu64".%c%"FMTu64".heap", prefix, prof_getpid(),
-		    prof_dump_seq, v, vseq);
+		if (opt_prof_pid_namespace) {
+			/* "<prefix>.<pid_namespace>.<pid>.<seq>.v<vseq>.heap" */
+			malloc_snprintf(filename, DUMP_FILENAME_BUFSIZE,
+			    "%s.%ld.%d.%"FMTu64".%c%"FMTu64".heap", prefix,
+			    prof_get_pid_namespace(), prof_getpid(), prof_dump_seq, v,
+			    vseq);
+		} else {
+			/* "<prefix>.<pid>.<seq>.v<vseq>.heap" */
+			malloc_snprintf(filename, DUMP_FILENAME_BUFSIZE,
+			    "%s.%d.%"FMTu64".%c%"FMTu64".heap", prefix, prof_getpid(),
+			    prof_dump_seq, v, vseq);
+		}
 	} else {
-	        /* "<prefix>.<pid>.<seq>.<v>.heap" */
-		malloc_snprintf(filename, DUMP_FILENAME_BUFSIZE,
-		    "%s.%d.%"FMTu64".%c.heap", prefix, prof_getpid(),
-		    prof_dump_seq, v);
+		if (opt_prof_pid_namespace) {
+			/* "<prefix>.<pid_namespace>.<pid>.<seq>.<v>.heap" */
+			malloc_snprintf(filename, DUMP_FILENAME_BUFSIZE,
+			    "%s.%ld.%d.%"FMTu64".%c.heap", prefix,
+			    prof_get_pid_namespace(), prof_getpid(), prof_dump_seq, v);
+		} else {
+			/* "<prefix>.<pid>.<seq>.<v>.heap" */
+			malloc_snprintf(filename, DUMP_FILENAME_BUFSIZE,
+			    "%s.%d.%"FMTu64".%c.heap", prefix, prof_getpid(),
+			    prof_dump_seq, v);
+		}
 	}
 	prof_dump_seq++;
 }
@@ -729,8 +886,14 @@ prof_dump_filename(tsd_t *tsd, char *filename, char v, uint64_t vseq) {
 void
 prof_get_default_filename(tsdn_t *tsdn, char *filename, uint64_t ind) {
 	malloc_mutex_lock(tsdn, &prof_dump_filename_mtx);
-	malloc_snprintf(filename, PROF_DUMP_FILENAME_LEN,
-	    "%s.%d.%"FMTu64".json", prof_prefix_get(tsdn), prof_getpid(), ind);
+	if (opt_prof_pid_namespace) {
+		malloc_snprintf(filename, PROF_DUMP_FILENAME_LEN,
+		    "%s.%ld.%d.%"FMTu64".json", prof_prefix_get(tsdn),
+		    prof_get_pid_namespace(), prof_getpid(), ind);
+	} else {
+		malloc_snprintf(filename, PROF_DUMP_FILENAME_LEN,
+		    "%s.%d.%"FMTu64".json", prof_prefix_get(tsdn), prof_getpid(), ind);
+	}
 	malloc_mutex_unlock(tsdn, &prof_dump_filename_mtx);
 }
 

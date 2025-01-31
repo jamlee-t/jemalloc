@@ -1,6 +1,12 @@
 #ifndef JEMALLOC_INTERNAL_PAGES_EXTERNS_H
 #define JEMALLOC_INTERNAL_PAGES_EXTERNS_H
 
+#include "jemalloc/internal/jemalloc_preamble.h"
+#include "jemalloc/internal/jemalloc_internal_types.h"
+
+/* Actual operating system page size, detected during bootstrap, <= PAGE. */
+extern size_t	os_page;
+
 /* Page size.  LG_PAGE is determined by the configure script. */
 #ifdef PAGE_MASK
 #  undef PAGE_MASK
@@ -9,7 +15,7 @@
 #define PAGE_MASK	((size_t)(PAGE - 1))
 /* Return the page base address for the page containing address a. */
 #define PAGE_ADDR2BASE(a)						\
-	((void *)((uintptr_t)(a) & ~PAGE_MASK))
+	ALIGNMENT_ADDR2BASE(a, PAGE)
 /* Return the smallest pagesize multiple that is >= s. */
 #define PAGE_CEILING(s)							\
 	(((s) + PAGE_MASK) & ~PAGE_MASK)
@@ -20,6 +26,14 @@
 /* Huge page size.  LG_HUGEPAGE is determined by the configure script. */
 #define HUGEPAGE	((size_t)(1U << LG_HUGEPAGE))
 #define HUGEPAGE_MASK	((size_t)(HUGEPAGE - 1))
+
+/*
+ * Used to validate that the hugepage size is not unexpectedly high.  The huge
+ * page features (HPA, metadata_thp) are primarily designed with a 2M THP size
+ * in mind.  Much larger sizes are not tested and likely to cause issues such as
+ * bad fragmentation or simply broken.
+ */
+#define HUGEPAGE_MAX_EXPECTED_SIZE ((size_t)(16U << 20))
 
 #if LG_HUGEPAGE != 0
 #  define HUGEPAGE_PAGES (HUGEPAGE / PAGE)
@@ -36,7 +50,7 @@
 
 /* Return the huge page base address for the huge page containing address a. */
 #define HUGEPAGE_ADDR2BASE(a)						\
-	((void *)((uintptr_t)(a) & ~HUGEPAGE_MASK))
+	ALIGNMENT_ADDR2BASE(a, HUGEPAGE)
 /* Return the smallest pagesize multiple that is >= s. */
 #define HUGEPAGE_CEILING(s)						\
 	(((s) + HUGEPAGE_MASK) & ~HUGEPAGE_MASK)
@@ -99,7 +113,7 @@ typedef enum {
 #define THP_MODE_DEFAULT thp_mode_default
 extern thp_mode_t opt_thp;
 extern thp_mode_t init_system_thp_mode; /* Initial system wide state. */
-extern const char *thp_mode_names[];
+extern const char *const thp_mode_names[];
 
 void *pages_map(void *addr, size_t size, size_t alignment, bool *commit);
 void pages_unmap(void *addr, size_t size);
@@ -109,6 +123,7 @@ bool pages_purge_lazy(void *addr, size_t size);
 bool pages_purge_forced(void *addr, size_t size);
 bool pages_huge(void *addr, size_t size);
 bool pages_nohuge(void *addr, size_t size);
+bool pages_collapse(void *addr, size_t size);
 bool pages_dontdump(void *addr, size_t size);
 bool pages_dodump(void *addr, size_t size);
 bool pages_boot(void);

@@ -1,6 +1,7 @@
 #ifndef JEMALLOC_INTERNAL_SIZE_H
 #define JEMALLOC_INTERNAL_SIZE_H
 
+#include "jemalloc/internal/jemalloc_preamble.h"
 #include "jemalloc/internal/bit_util.h"
 #include "jemalloc/internal/pages.h"
 #include "jemalloc/internal/sc.h"
@@ -151,8 +152,8 @@ sz_psz2u(size_t psz) {
 	return usize;
 }
 
-static inline szind_t
-sz_size2index_compute(size_t size) {
+JEMALLOC_ALWAYS_INLINE szind_t
+sz_size2index_compute_inline(size_t size) {
 	if (unlikely(size > SC_LARGE_MAXCLASS)) {
 		return SC_NSIZES;
 	}
@@ -185,6 +186,11 @@ sz_size2index_compute(size_t size) {
 	}
 }
 
+static inline szind_t
+sz_size2index_compute(size_t size) {
+	return sz_size2index_compute_inline(size);
+}
+
 JEMALLOC_ALWAYS_INLINE szind_t
 sz_size2index_lookup_impl(size_t size) {
 	assert(size <= SC_LOOKUP_MAXCLASS);
@@ -207,8 +213,8 @@ sz_size2index(size_t size) {
 	return sz_size2index_compute(size);
 }
 
-static inline size_t
-sz_index2size_compute(szind_t index) {
+JEMALLOC_ALWAYS_INLINE size_t
+sz_index2size_compute_inline(szind_t index) {
 #if (SC_NTINY > 0)
 	if (index < SC_NTINY) {
 		return (ZU(1) << (SC_LG_TINY_MAXCLASS - SC_NTINY + 1 + index));
@@ -233,6 +239,11 @@ sz_index2size_compute(szind_t index) {
 	}
 }
 
+static inline size_t
+sz_index2size_compute(szind_t index) {
+	return sz_index2size_compute_inline(index);
+}
+
 JEMALLOC_ALWAYS_INLINE size_t
 sz_index2size_lookup_impl(szind_t index) {
 	return sz_index2size_tab[index];
@@ -253,8 +264,19 @@ sz_index2size(szind_t index) {
 
 JEMALLOC_ALWAYS_INLINE void
 sz_size2index_usize_fastpath(size_t size, szind_t *ind, size_t *usize) {
-	*ind = sz_size2index_lookup_impl(size);
-	*usize = sz_index2size_lookup_impl(*ind);
+	if (util_compile_time_const(size)) {
+		/*
+		 * When inlined, the size may become known at compile
+		 * time, which allows static computation through LTO.
+		 */
+		*ind = sz_size2index_compute_inline(size);
+		assert(*ind == sz_size2index_lookup_impl(size));
+		*usize = sz_index2size_compute_inline(*ind);
+		assert(*usize == sz_index2size_lookup_impl(*ind));
+	} else {
+		*ind = sz_size2index_lookup_impl(size);
+		*usize = sz_index2size_lookup_impl(*ind);
+	}
 }
 
 JEMALLOC_ALWAYS_INLINE size_t
@@ -363,6 +385,21 @@ sz_sa2u(size_t size, size_t alignment) {
 		return 0;
 	}
 	return usize;
+}
+
+/*
+ * Under normal circumstances, whether or not to use a slab
+ * to satisfy an allocation depends solely on the allocation's
+ * effective size. However, this is *not* the case when an allocation
+ * is sampled for profiling, in which case you *must not* use a slab
+ * regardless of the effective size. Thus `sz_can_use_slab` is called
+ * on the common path, but there exist `*_explicit_slab` variants of
+ * several functions for handling the aforementioned case of
+ * sampled allocations.
+ */
+JEMALLOC_ALWAYS_INLINE bool
+sz_can_use_slab(size_t size) {
+	return size <= SC_SMALL_MAXCLASS;
 }
 
 size_t sz_psz_quantize_floor(size_t size);

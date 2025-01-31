@@ -85,8 +85,10 @@ prof_tctx_comp(const prof_tctx_t *a, const prof_tctx_t *b) {
 	return ret;
 }
 
+/* NOLINTBEGIN(performance-no-int-to-ptr) */
 rb_gen(static UNUSED, tctx_tree_, prof_tctx_tree_t, prof_tctx_t,
     tctx_link, prof_tctx_comp)
+/* NOLINTEND(performance-no-int-to-ptr) */
 
 static int
 prof_gctx_comp(const prof_gctx_t *a, const prof_gctx_t *b) {
@@ -100,8 +102,10 @@ prof_gctx_comp(const prof_gctx_t *a, const prof_gctx_t *b) {
 	return ret;
 }
 
+/* NOLINTBEGIN(performance-no-int-to-ptr) */
 rb_gen(static UNUSED, gctx_tree_, prof_gctx_tree_t, prof_gctx_t, dump_link,
     prof_gctx_comp)
+/* NOLINTEND(performance-no-int-to-ptr) */
 
 static int
 prof_tdata_comp(const prof_tdata_t *a, const prof_tdata_t *b) {
@@ -119,8 +123,10 @@ prof_tdata_comp(const prof_tdata_t *a, const prof_tdata_t *b) {
 	return ret;
 }
 
+/* NOLINTBEGIN(performance-no-int-to-ptr) */
 rb_gen(static UNUSED, tdata_tree_, prof_tdata_tree_t, prof_tdata_t, tdata_link,
     prof_tdata_comp)
+/* NOLINTEND(performance-no-int-to-ptr) */
 
 /******************************************************************************/
 
@@ -503,7 +509,7 @@ prof_double_uint64_cast(double d) {
 }
 #endif
 
-void prof_unbias_map_init() {
+void prof_unbias_map_init(void) {
 	/* See the comment in prof_sample_new_event_wait */
 #ifdef JEMALLOC_PROF
 	for (szind_t i = 0; i < SC_NSIZES; i++) {
@@ -703,6 +709,7 @@ prof_tctx_merge_iter(prof_tctx_tree_t *tctxs, prof_tctx_t *tctx, void *arg) {
 	case prof_tctx_state_purgatory:
 		prof_tctx_merge_gctx(tsdn, tctx, tctx->gctx);
 		break;
+	case prof_tctx_state_initializing:
 	default:
 		not_reached();
 	}
@@ -758,6 +765,7 @@ prof_tctx_finish_iter(prof_tctx_tree_t *tctxs, prof_tctx_t *tctx, void *arg) {
 	case prof_tctx_state_purgatory:
 		ret = tctx;
 		goto label_return;
+	case prof_tctx_state_initializing:
 	default:
 		not_reached();
 	}
@@ -1141,7 +1149,7 @@ prof_tdata_init_impl(tsd_t *tsd, uint64_t thr_uid, uint64_t thr_discrim,
 		return NULL;
 	}
 
-	tdata->vec = (void **)((uintptr_t)tdata + tdata_sz);
+	tdata->vec = (void **)((byte_t *)tdata + tdata_sz);
 	tdata->lock = prof_tdata_mutex_choose(thr_uid);
 	tdata->thr_uid = thr_uid;
 	tdata->thr_discrim = thr_discrim;
@@ -1387,6 +1395,8 @@ prof_tctx_destroy(tsd_t *tsd, prof_tctx_t *tctx) {
 		destroy_tctx = false;
 		destroy_gctx = false;
 		break;
+	case prof_tctx_state_initializing:
+	case prof_tctx_state_purgatory:
 	default:
 		not_reached();
 		destroy_tctx = false;

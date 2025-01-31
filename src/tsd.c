@@ -22,9 +22,17 @@ JEMALLOC_TSD_TYPE_ATTR(tsd_t) tsd_tls = TSD_INITIALIZER;
 pthread_key_t tsd_tsd;
 bool tsd_booted = false;
 #elif (defined(_WIN32))
+#if defined(JEMALLOC_LEGACY_WINDOWS_SUPPORT) || !defined(_MSC_VER)
 DWORD tsd_tsd;
-tsd_wrapper_t tsd_boot_wrapper = {false, TSD_INITIALIZER};
+tsd_wrapper_t tsd_boot_wrapper = {TSD_INITIALIZER, false};
+#else
+JEMALLOC_TSD_TYPE_ATTR(tsd_wrapper_t) tsd_wrapper_tls = { TSD_INITIALIZER, false };
+#endif
 bool tsd_booted = false;
+#if JEMALLOC_WIN32_TLSGETVALUE2
+TGV2 tls_get_value2 = NULL;
+HMODULE tgv2_mod = NULL;
+#endif
 #else
 
 /*
@@ -148,7 +156,7 @@ tsd_local_slow(tsd_t *tsd) {
 }
 
 bool
-tsd_global_slow() {
+tsd_global_slow(void) {
 	return atomic_load_u32(&tsd_global_slow_count, ATOMIC_RELAXED) > 0;
 }
 
